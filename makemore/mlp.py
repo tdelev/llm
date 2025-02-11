@@ -1,5 +1,5 @@
 import torch
-import matplotlib.pyplot as pl
+import matplotlib.pyplot as plt
 import torch.nn.functional as F
 import random
 
@@ -10,6 +10,67 @@ stoi = {s:i + 1 for i,s in enumerate(chars)}
 stoi['.'] = 0
 itos = {i + 1:s for i,s in enumerate(chars)}
 itos[0] = '.'
+g = torch.Generator().manual_seed(2147483647)
+
+class Linear:
+
+    def __init__(self, fan_in, fan_out, bias=True):
+        self.weight = torch.randn((fan_in, fan_out), generator=g) / fan_in**0.5
+        self.bias = torch.zeros(fan_out) if bias else None
+
+    def __call__(self, x):
+        self.out = x @ self.weight
+        if self.bias is not None:
+            self.out += self.bias
+        return self.out
+
+    def parameters(self):
+        return [self.weight] + [] if self.bias is None else [self.bias]
+
+
+class BatchNorm1d:
+
+    def __init__(self, dim, eps=1e-5, momentum=0.1):
+        self.eps = eps
+        self.momentum = momentum
+        self.training = True
+        # paramters (trained with backprop)
+        self.gamma = torch.ones(dim)
+        self.beta = torch.zeros(dim)
+        # buffers (trained with running 'momentum update')
+        self.running_mean = torch.zeros(dim)
+        self.running_var = torch.ones(dim)
+        
+    def __call__(self, x):
+        if self.training:
+            xmean = x.mean(0, keepdim=True)
+            xvar = x.var(0, keepdim=True)
+        else:
+            xmean = self.running_mean
+            xvar = self.running_var
+
+        xhat = (x - xmean) / torch.sqrt(xvar + self.eps) # normalize to unit variance
+        self.out = self.gamma * xhat + self.beta
+        # update the buffers
+        if self.training:
+            with torch.no_grad():
+                self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * xmean
+                self.running_var = (1 - self.momentum) * self.running_var + self.momentum * xvar
+        return self.out
+
+    def paramters(self):
+        return [self.gamma, self.beta]
+
+
+class Tanh:
+
+    def __call__(self, x):
+        self.out = torch.tanh(x)
+        return self.out
+
+    def parameters(self):
+        return []
+
 BLOCK_SIZE = 3 # context legnth: how many characters we take to predict the next one?
 VOCAB_SIZE = 27 # the vocabulary size
 HIDDEN_LAYER_SIZE = 200 # the number of neurons in the hidden layer
@@ -40,17 +101,35 @@ n2 = int(0.9*len(words))
 Xtr, Ytr = build_dataset(words[:n1])
 Xdev, Ydev = build_dataset(words[n1:n2])
 Xte, Yte = build_dataset(words[n2:])
-C = torch.randn((VOCAB_SIZE, DIMENSIONS))
-W1 = torch.randn((CD, HIDDEN_LAYER_SIZE)) * (5/3)/(CD ** 0.5)
-b1 = torch.randn(HIDDEN_LAYER_SIZE) * 0.01
-W2 = torch.randn((HIDDEN_LAYER_SIZE, VOCAB_SIZE)) * 0.01
-b2 = torch.randn(VOCAB_SIZE) * 0
-bngain = torch.ones((1, HIDDEN_LAYER_SIZE))
-bnbias = torch.zeros((1, HIDDEN_LAYER_SIZE))
-bnmean_running = torch.zeros((1, HIDDEN_LAYER_SIZE))
-bnstd_running = torch.ones((1, HIDDEN_LAYER_SIZE))
 
-parameters = [C, W1, b1, W2, b2, bngain, bnbias]
+C = torch.randn((VOCAB_SIZE, DIMENSIONS), generator=g)
+layers = [
+    Linear(CD, HIDDEN_LAYER_SIZE), Tanh(),
+    Linear(HIDDEN_LAYER_SIZE, HIDDEN_LAYER_SIZE), Tanh(),
+    Linear(HIDDEN_LAYER_SIZE, HIDDEN_LAYER_SIZE), Tanh(),
+    Linear(HIDDEN_LAYER_SIZE, HIDDEN_LAYER_SIZE), Tanh(),
+    Linear(HIDDEN_LAYER_SIZE, VOCAB_SIZE),
+]
+
+with torch.no_grad():
+    # last layer: make it less confident
+    layers[-1].weight *= 0.1
+    # all layers: apply gain
+    for layer in layers[:-1]:
+        if isinstance(layer, Linear):
+            layer.weight *= 5/3
+
+# W1 = torch.randn((CD, HIDDEN_LAYER_SIZE)) * (5/3)/(CD ** 0.5)
+# b1 = torch.randn(HIDDEN_LAYER_SIZE) * 0.01
+# W2 = torch.randn((HIDDEN_LAYER_SIZE, VOCAB_SIZE)) * 0.01
+# b2 = torch.randn(VOCAB_SIZE) * 0
+# bngain = torch.ones((1, HIDDEN_LAYER_SIZE))
+# bnbias = torch.zeros((1, HIDDEN_LAYER_SIZE))
+# bnmean_running = torch.zeros((1, HIDDEN_LAYER_SIZE))
+# bnstd_running = torch.ones((1, HIDDEN_LAYER_SIZE))
+
+# parameters = [C, W1, b1, W2, b2, bngain, bnbias]
+parameters = [C] + [p for layer in layers for p in layer.parameters()]
 total_params = sum(p.nelement() for p in parameters)
 print('Total parameters: ', total_params)
 for p in parameters:
@@ -71,42 +150,37 @@ BATCH_SIZE = 32
 #     bnstd = hlpreact.std(0, keepdim=True)
 
 
-@torch.no_grad()
-def eval(X, Y):
-    emb = C[X]
-    embcat = emb.view(-1, CD) # concatenate the vectors
-    hlpreact = embcat @ W1 + b1  # hidden layer pre-activation
-    # measure the mean/std over the entire training set
-    hlpreact = bngain * (hlpreact - bnmean_running) / bnstd_running + bnbias
-    h = torch.tanh(hlpreact)
-    logits = h @ W2 + b2
-    loss = F.cross_entropy(logits, Y)
-    return loss
+# @torch.no_grad()
+# def eval(X, Y):
+#     emb = C[X]
+#     embcat = emb.view(-1, CD) # concatenate the vectors
+#     hlpreact = embcat @ W1 + b1  # hidden layer pre-activation
+#     # measure the mean/std over the entire training set
+#     hlpreact = bngain * (hlpreact - bnmean_running) / bnstd_running + bnbias
+#     h = torch.tanh(hlpreact)
+#     logits = h @ W2 + b2
+#     loss = F.cross_entropy(logits, Y)
+#     return loss
 
-# def train(X, Y):
 for i in range(STEPS):
     # minibatch construct
     ix = torch.randint(0, Xtr.shape[0], (BATCH_SIZE,))
+    Xb, Yb = Xtr[ix], Ytr[ix]
 
     # forward pass
-    emb = C[Xtr[ix]] # embed the characters into vectors
-    embcat = emb.view(-1, CD) # concatenate the vectors
-    hlpreact = embcat @ W1 + b1  # hidden layer pre-activation
-    bnmeani = hlpreact.mean(0, keepdim=True)
-    bnstdi = hlpreact.std(0, keepdim=True)
-    hlpreact = bngain * (hlpreact - bnmeani) / bnstdi + bnbias
+    emb = C[Xb] # embed the characters into vectors
+    x = emb.view(-1, CD) # concatenate the vectors
+    for layer in layers:
+        x = layer(x)
 
-    with torch.no_grad():
-        bnmean_running = 0.999 * bnmean_running + 0.001 * bnmeani
-        bnstd_running = 0.999 * bnstd_running + 0.001 * bnstdi
-    
-    h = torch.tanh(hlpreact) # hidden layer
-    logits = h @ W2 + b2 # output layer
-    loss = F.cross_entropy(logits, Ytr[ix]) # loss function
+    loss = F.cross_entropy(x, Yb) # loss function
     # print('Loss: ', loss.item())
     lossi.append(loss.log10().item())
 
     # backward pass
+    for layer in layers:
+        layer.out.retain_grad()
+        
     for p in parameters:
         p.grad = None
     loss.backward()
@@ -122,16 +196,16 @@ for i in range(STEPS):
         print(f'{i:7d}/{STEPS:7d}: {loss.item():.4f}')
     # lri.append(lre[i])
     # lossi.append(loss.item())
+    break
 
 print('Loss: ', loss.item())
 
 # train(Xtr, Ytr)
 
-print('Validation loss: ', eval(Xdev, Ydev))
-print('Test loss: ', eval(Xte, Yte))
+# print('Validation loss: ', eval(Xdev, Ydev))
+# print('Test loss: ', eval(Xte, Yte))
 
 def sample():
-    g = torch.Generator().manual_seed(2147483647 + 10)
     for _ in range(20):
         out = []
         context = [0] * BLOCK_SIZE
@@ -148,5 +222,33 @@ def sample():
                 out.append(ix)
         print(''.join(itos[i] for i in out))
 
-pl.plot(torch.arange(STEPS).tolist(), lossi)
-pl.show()
+# plt.plot(torch.arange(STEPS).tolist(), lossi)
+# plt.show()
+
+
+# visualize historgrams
+
+plt.figure(figsize=(20, 4))
+legends = []
+for i, layer in enumerate(layers[:-1]):
+    if isinstance(layer, Tanh):
+        t = layer.out
+        print('layer %d (%10s): mean %+.2f, std %.2f, saturated: %.2f%%' % (i, layer.__class__.__name__, t.mean(), t.std(), (t.abs() > 0.97).float().mean() * 100))
+        hy, hx = torch.histogram(t, density=True)
+        plt.plot(hx[:-1].detach(), hy.detach())
+        legends.append(f'layer {i} ({layer.__class__.__name__})')
+plt.legend(legends)
+plt.title('activation distribution')
+
+plt.figure(figsize=(20, 4))
+legends = []
+for i, layer in enumerate(layers[:-1]):
+    if isinstance(layer, Tanh):
+        t = layer.out.grad
+        print('layer %d (%10s): mean %+f, std %e' % (i, layer.__class__.__name__, t.mean(), t.std()))
+        hy, hx = torch.histogram(t, density=True)
+        plt.plot(hx[:-1].detach(), hy.detach())
+        legends.append(f'layer {i} ({layer.__class__.__name__})')
+plt.legend(legends)
+plt.title('gradient distribution')
+plt.show()
