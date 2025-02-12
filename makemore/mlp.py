@@ -25,7 +25,7 @@ class Linear:
         return self.out
 
     def parameters(self):
-        return [self.weight] + [] if self.bias is None else [self.bias]
+        return [self.weight] + ([] if self.bias is None else [self.bias])
 
 
 class BatchNorm1d:
@@ -43,8 +43,12 @@ class BatchNorm1d:
         
     def __call__(self, x):
         if self.training:
-            xmean = x.mean(0, keepdim=True)
-            xvar = x.var(0, keepdim=True)
+            if x.ndim == 2:
+                dim = 0
+            elif x.ndim == 3:
+                dim = (0, 1)
+            xmean = x.mean(dim, keepdim=True)
+            xvar = x.var(dim, keepdim=True)
         else:
             xmean = self.running_mean
             xvar = self.running_var
@@ -58,7 +62,7 @@ class BatchNorm1d:
                 self.running_var = (1 - self.momentum) * self.running_var + self.momentum * xvar
         return self.out
 
-    def paramters(self):
+    def parameters(self):
         return [self.gamma, self.beta]
 
 
@@ -71,11 +75,53 @@ class Tanh:
     def parameters(self):
         return []
 
-BLOCK_SIZE = 3 # context legnth: how many characters we take to predict the next one?
+class Embedding:
+
+    def __init__(self, num_embeddings, embedding_dim):
+        self.weight = torch.randn((num_embeddings, embedding_dim), generator=g)
+
+    def __call__(self, IX):
+        self.out = self.weight[IX]
+        return self.out
+
+    def parameters(self):
+        return [self.weight]
+
+class FlattenConsecutive:
+
+    def __init__(self, n):
+        self.n = n
+
+    def __call__(self, x):
+        B, T, C = x.shape
+        x = x.view(B, T // self.n, C * self.n)
+        if x.shape[1] == 1:
+            x = x.squeeze(1)
+        self.out = x
+        return self.out
+
+    def parameters(self):
+        return []
+
+
+class Sequential:
+
+    def __init__(self, layers):
+        self.layers = layers
+
+    def __call__(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+    def parameters(self):
+        return [p for layer in self.layers for p in layer.parameters()]
+
+BLOCK_SIZE = 8 # context legnth: how many characters we take to predict the next one?
 VOCAB_SIZE = 27 # the vocabulary size
-HIDDEN_LAYER_SIZE = 200 # the number of neurons in the hidden layer
-DIMENSIONS = 10 # the dimensionality of the character embedding vectors
-CD = DIMENSIONS * BLOCK_SIZE
+N_HIDDEN = 68 # the number of neurons in the hidden layer
+N_EMBD = 10 # the dimensionality of the character embedding vectors
+CD = N_EMBD * BLOCK_SIZE
 
 def build_dataset(words):
     X, Y = [], []
@@ -102,34 +148,24 @@ Xtr, Ytr = build_dataset(words[:n1])
 Xdev, Ydev = build_dataset(words[n1:n2])
 Xte, Yte = build_dataset(words[n2:])
 
-C = torch.randn((VOCAB_SIZE, DIMENSIONS), generator=g)
-layers = [
-    Linear(CD, HIDDEN_LAYER_SIZE), Tanh(),
-    Linear(HIDDEN_LAYER_SIZE, HIDDEN_LAYER_SIZE), Tanh(),
-    Linear(HIDDEN_LAYER_SIZE, HIDDEN_LAYER_SIZE), Tanh(),
-    Linear(HIDDEN_LAYER_SIZE, HIDDEN_LAYER_SIZE), Tanh(),
-    Linear(HIDDEN_LAYER_SIZE, VOCAB_SIZE),
-]
+model = Sequential([
+    Embedding(VOCAB_SIZE, N_EMBD),
+    FlattenConsecutive(2), Linear(N_EMBD * 2, N_HIDDEN, bias=False), BatchNorm1d(N_HIDDEN), Tanh(),
+    FlattenConsecutive(2), Linear(N_HIDDEN * 2, N_HIDDEN, bias=False), BatchNorm1d(N_HIDDEN), Tanh(),
+    FlattenConsecutive(2), Linear(N_HIDDEN * 2, N_HIDDEN, bias=False), BatchNorm1d(N_HIDDEN), Tanh(),
+    Linear(N_HIDDEN, VOCAB_SIZE), 
+])
 
 with torch.no_grad():
     # last layer: make it less confident
-    layers[-1].weight *= 0.1
+    # layers[-1].weight *= 0.1
     # all layers: apply gain
-    for layer in layers[:-1]:
+    for layer in model.layers[:-1]:
         if isinstance(layer, Linear):
             layer.weight *= 5/3
 
-# W1 = torch.randn((CD, HIDDEN_LAYER_SIZE)) * (5/3)/(CD ** 0.5)
-# b1 = torch.randn(HIDDEN_LAYER_SIZE) * 0.01
-# W2 = torch.randn((HIDDEN_LAYER_SIZE, VOCAB_SIZE)) * 0.01
-# b2 = torch.randn(VOCAB_SIZE) * 0
-# bngain = torch.ones((1, HIDDEN_LAYER_SIZE))
-# bnbias = torch.zeros((1, HIDDEN_LAYER_SIZE))
-# bnmean_running = torch.zeros((1, HIDDEN_LAYER_SIZE))
-# bnstd_running = torch.ones((1, HIDDEN_LAYER_SIZE))
 
-# parameters = [C, W1, b1, W2, b2, bngain, bnbias]
-parameters = [C] + [p for layer in layers for p in layer.parameters()]
+parameters = model.parameters()
 total_params = sum(p.nelement() for p in parameters)
 print('Total parameters: ', total_params)
 for p in parameters:
@@ -139,7 +175,8 @@ lre = torch.linspace(-3, 0, 1000)
 lrs = 10**lre
 lri = []
 lossi = []
-STEPS = 200_000
+ud = []
+STEPS = 50_000
 BATCH_SIZE = 32
 
 # with torch.no_grad():
@@ -148,71 +185,70 @@ BATCH_SIZE = 32
 #     hlpreact = embcat @ W1 + b1
 #     bnmean = hlpreact.mean(0, keepdim=True)
 #     bnstd = hlpreact.std(0, keepdim=True)
+#
+#
+for layer in model.layers:
+    layer.training = False
 
-
-# @torch.no_grad()
-# def eval(X, Y):
-#     emb = C[X]
-#     embcat = emb.view(-1, CD) # concatenate the vectors
-#     hlpreact = embcat @ W1 + b1  # hidden layer pre-activation
-#     # measure the mean/std over the entire training set
-#     hlpreact = bngain * (hlpreact - bnmean_running) / bnstd_running + bnbias
-#     h = torch.tanh(hlpreact)
-#     logits = h @ W2 + b2
-#     loss = F.cross_entropy(logits, Y)
-#     return loss
-
-for i in range(STEPS):
-    # minibatch construct
-    ix = torch.randint(0, Xtr.shape[0], (BATCH_SIZE,))
-    Xb, Yb = Xtr[ix], Ytr[ix]
-
-    # forward pass
-    emb = C[Xb] # embed the characters into vectors
-    x = emb.view(-1, CD) # concatenate the vectors
-    for layer in layers:
+@torch.no_grad()
+def eval(X, Y):
+    x = X
+    for layer in model.layers:
         x = layer(x)
+    loss = F.cross_entropy(x, Y)
+    return loss
 
-    loss = F.cross_entropy(x, Yb) # loss function
-    # print('Loss: ', loss.item())
-    lossi.append(loss.log10().item())
+def train():
+    for i in range(STEPS):
+        # minibatch construct
+        ix = torch.randint(0, Xtr.shape[0], (BATCH_SIZE,))
+        Xb, Yb = Xtr[ix], Ytr[ix]
 
-    # backward pass
-    for layer in layers:
-        layer.out.retain_grad()
-        
-    for p in parameters:
-        p.grad = None
-    loss.backward()
+        # forward pass
+        logits = model(Xb)
 
-    # update
-    # lr = lrs[i]
-    lr = 0.1 if i < STEPS * .5 else 0.01
-    for p in parameters:
-        p.data += -lr * p.grad
+        loss = F.cross_entropy(logits, Yb) # loss function
+        # print('Loss: ', loss.item())
+        lossi.append(loss.log10().item())
 
-    # track stats
-    if i % 10_000 == 0:
-        print(f'{i:7d}/{STEPS:7d}: {loss.item():.4f}')
-    # lri.append(lre[i])
-    # lossi.append(loss.item())
-    break
+        # backward pass
+        # for layer in layers:
+        #     layer.out.retain_grad()
+            
+        for p in parameters:
+            p.grad = None
+        loss.backward()
 
-print('Loss: ', loss.item())
+        # update
+        # lr = lrs[i]
+        lr = 0.1 if i < STEPS * .5 else 0.01
+        for p in parameters:
+            p.data += -lr * p.grad
 
-# train(Xtr, Ytr)
+        # track stats
+        if i % 10_000 == 0:
+            print(f'{i:7d}/{STEPS:7d}: {loss.item():.4f}')
+        # lri.append(lre[i])
+        # lossi.append(loss.item())
+        with torch.no_grad():
+            ud.append([(lr * p.grad.std() / p.data.std()).log10().item() for p in parameters])
 
-# print('Validation loss: ', eval(Xdev, Ydev))
-# print('Test loss: ', eval(Xte, Yte))
+        # if i >= 999:
+        #     break
+    print('Loss: ', loss.item())
+    return i
+
+steps = train()
+
+print('Validation loss: ', eval(Xdev, Ydev))
+print('Test loss: ', eval(Xte, Yte))
 
 def sample():
     for _ in range(20):
         out = []
         context = [0] * BLOCK_SIZE
         while True:
-            emb = C[torch.tensor([context])] # (1, BLOCK_SIZE, d)
-            h = torch.tanh(emb.view(-1, CD) @ W1 + b1)
-            logits = h @ W2 + b2
+            logits = model(torch.tensor([context]))            
             probs = F.softmax(logits, dim=1)
             ix = torch.multinomial(probs, num_samples=1, replacement=True, generator=g).item()
             context = context[1:] + [ix]
@@ -222,33 +258,53 @@ def sample():
                 out.append(ix)
         print(''.join(itos[i] for i in out))
 
+sample()
 # plt.plot(torch.arange(STEPS).tolist(), lossi)
-# plt.show()
+if steps // 1000 > 5:
+    plt.plot(torch.tensor(lossi).view(-1, 1000).mean(1))
+    plt.show()
 
+# ix = torch.randint(0, Xtr.shape[0], (4, ))
+# Xb, Yb = Xtr[ix], Ytr[ix]
+# logits = model(Xb)
+# print(Xb.shape)
+# Xb
+#
+# for layer in model.layers:
+#     print(layer.__class__.__name__, ' : ', tuple(layer.out.shape))
 
 # visualize historgrams
 
-plt.figure(figsize=(20, 4))
-legends = []
-for i, layer in enumerate(layers[:-1]):
-    if isinstance(layer, Tanh):
-        t = layer.out
-        print('layer %d (%10s): mean %+.2f, std %.2f, saturated: %.2f%%' % (i, layer.__class__.__name__, t.mean(), t.std(), (t.abs() > 0.97).float().mean() * 100))
-        hy, hx = torch.histogram(t, density=True)
-        plt.plot(hx[:-1].detach(), hy.detach())
-        legends.append(f'layer {i} ({layer.__class__.__name__})')
-plt.legend(legends)
-plt.title('activation distribution')
-
-plt.figure(figsize=(20, 4))
-legends = []
-for i, layer in enumerate(layers[:-1]):
-    if isinstance(layer, Tanh):
-        t = layer.out.grad
-        print('layer %d (%10s): mean %+f, std %e' % (i, layer.__class__.__name__, t.mean(), t.std()))
-        hy, hx = torch.histogram(t, density=True)
-        plt.plot(hx[:-1].detach(), hy.detach())
-        legends.append(f'layer {i} ({layer.__class__.__name__})')
-plt.legend(legends)
-plt.title('gradient distribution')
-plt.show()
+# plt.figure(figsize=(20, 4))
+# legends = []
+# for i, layer in enumerate(layers[:-1]):
+#     if isinstance(layer, Tanh):
+#         t = layer.out
+#         print('layer %d (%10s): mean %+.2f, std %.2f, saturated: %.2f%%' % (i, layer.__class__.__name__, t.mean(), t.std(), (t.abs() > 0.97).float().mean() * 100))
+#         hy, hx = torch.histogram(t, density=True)
+#         plt.plot(hx[:-1].detach(), hy.detach())
+#         legends.append(f'layer {i} ({layer.__class__.__name__})')
+# plt.legend(legends)
+# plt.title('activation distribution')
+#
+# plt.figure(figsize=(20, 4))
+# legends = []
+# for i, layer in enumerate(layers[:-1]):
+#     if isinstance(layer, Tanh):
+#         t = layer.out.grad
+#         print('layer %d (%10s): mean %+f, std %e' % (i, layer.__class__.__name__, t.mean(), t.std()))
+#         hy, hx = torch.histogram(t, density=True)
+#         plt.plot(hx[:-1].detach(), hy.detach())
+#         legends.append(f'layer {i} ({layer.__class__.__name__})')
+# plt.legend(legends)
+# plt.title('gradient distribution')
+#
+# plt.figure(figsize=(20, 4))
+# legends = []
+# for i, p in enumerate(parameters):
+#     if p.ndim == 2:
+#         plt.plot([ud[j][i] for j in range(len(ud))])
+#         legends.append('param %d' % i)
+# plt.plot([0, len(ud)], [-3, -3], 'k') # these ratios should be ~1e-3, indicate on plot
+# plt.legend(legends)
+# plt.show()
